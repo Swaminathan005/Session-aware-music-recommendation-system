@@ -14,7 +14,7 @@ fig = px.scatter(
     title="Song embedding space"
 )
 
-fig.update_traces(marker={"size": 10, "opacity": 0.65})
+fig.update_traces(marker={"size": 101, "opacity": 0.65})
 
 fig.update_layout(
     xaxis_title="UMAP dimension 1",
