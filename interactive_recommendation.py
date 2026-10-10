@@ -204,7 +204,7 @@ def draw_header():
     # The ASCII art lines (7 lines) as provided by the user (after revert)
     lines = [
         " ██████╗ ██████╗  ██████╗ ██╗   ██╗███████╗ ♪",
-        "██╔════╝ ██╔══██╗██╔═══██╗██║   ██║██╔════╝",
+        "██╔════╝ ██╔══██╗██╔══██╗██║   ██║██╔════╝",
         "██║  ███╗██████╔╝██║   ██║██║   ██║█████╗",
         "██║   ██║██╔══██╗██║   ██║╚██╗ ██╔╝██╔══╝",
         "╚██████╔╝██║  ██║╚██████╔╝ ⚪ ⚪ ⚪ ⚪ ⚪ ⚪ ⚪ ⚪ ⚪ ⚪",
@@ -426,6 +426,8 @@ def main():
             if session_active:
                 recs = recommend(s_vec, u_vec, session_embeds, E, id2idx, idx2id, metadata, topn=TOP_FINAL)
                 last_recs = recs
+                # Store top-N recommendations in Redis cache (for hybrid algorithm)
+                db.set_top_n_cache(db.USER_ID, "hybrid", [(score, song_id) for (song_id, _, score) in recs])
             else:
                 last_recs = []  # no recs if no session
         elif cmd.lower() == "schema":
@@ -442,20 +444,17 @@ def main():
             if idx is not None and 0 <= idx < n_songs and session_active:
                 # select song
                 song_vec = E[idx]
-                # Update session vector (fast)
+                # Update session vector (fast) and persist atomically to Redis
                 s_vec = update_session(s_vec, song_vec, LR_SESSION)
-                # Persist updated session vector to Redis
                 if session_id is not None:
-                    db.set_session_vector(session_id, s_vec)
+                    timestamp_ms = int(datetime.now().timestamp() * 1000)
+                    db.atomic_hot_update(session_id, idx2id[int(idx)], s_vec, timestamp_ms)
+                    # Also update Cassandra playcount counter
+                    db.increment_playcount_cassandra(db.USER_ID, idx2id[int(idx)])
                 # Keep raw embeddings for direction
                 session_embeds.append(song_vec)
-                # Store song ID in session history (Redis list)
-                if session_id is not None:
-                    db.add_to_session_history(session_id, idx2id[int(idx)])
                 # Store selected song ID for UI
                 session_song_ids.append(idx2id[int(idx)])
-                # Increment playcount in Redis
-                db.increment_playcount(db.USER_ID, idx2id[int(idx)])
                 # Log listening event to Cassandra
                 db.log_listening_event(
                     user_id=db.USER_ID,

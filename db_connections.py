@@ -5,6 +5,7 @@ db_connections.py
 Handles connections to MongoDB, Redis, and Cassandra.
 Provides helper functions to load metadata, embeddings, and to store/retrieve
 vectors, counters, and logs.
+Includes atomic hot-state updates and top-N recommendation caching.
 """
 
 import os
@@ -25,6 +26,46 @@ import redis
 from cassandra.cluster import Cluster
 from cassandra.auth import PlainTextAuthProvider
 from cassandra.query import SimpleStatement, PreparedStatement
+
+# -------------------------- CONFIGURATION --------------------------
+# Connection details (localhost, default ports)
+MONGO_HOST = "localhost"
+MONGO_PORT = 27017
+MONGO_DB_NAME = "music_rec"
+MONGO_COLLECTION_SONGS = "songs"
+
+REDIS_HOST = "localhost"
+REDIS_PORT = 6379
+REDIS_DB = 0
+
+CASSANDRA_HOSTS = ["127.0.0.1"]
+CASSANDRA_PORT = 9042
+CASSANDRA_KEYSPACE = "music_rec"
+
+# User ID (for simplicity, we use a single fixed user)
+USER_ID = "user1"
+
+# Lua script for atomic hot-state updates (session vector, playcount, history)
+ATOMIC_HOT_UPDATE_LUA = """
+local sess_vec_key = KEYS[1]
+local playcount_key = KEYS[2]
+local sess_hist_key = KEYS[3]
+local new_vec_blob = ARGV[1]
+local new_norm = tonumber(ARGV[2])
+local song_id = ARGV[3]
+local timestamp_ms = tonumber(ARGV[4])
+
+-- Update session vector hash
+redis.call('HSET', sess_vec_key, 'vec', new_vec_blob, 'norm', new_norm, 'updated_at', timestamp_ms)
+
+-- Increment playcount for user-song
+redis.call('HINCRBY', playcount_key, 'count', 1)
+
+-- Push song ID to session history list (most recent first)
+redis.call('LPUSH', sess_hist_key, song_id)
+
+return 1
+"""
 
 # -------------------------- CONFIGURATION --------------------------
 # Connection details (localhost, default ports)
@@ -150,7 +191,7 @@ def _ensure_tables():
         CREATE TABLE IF NOT EXISTS playcount_agg (
             user_id text,
             song_id text,
-            play_count counter,
+            play_count int,
             last_played timestamp,
             PRIMARY KEY ((user_id), song_id)
         );
@@ -349,9 +390,28 @@ def set_session_vector(session_id: str, vec: np.ndarray) -> None:
         print(f"Warning: Failed to set session vector in Redis: {e}")
 
 
-# -------------------------- Play counts (Redis) --------------------------
-def increment_playcount(user_id: str, song_id: str, amount: int = 1) -> None:
-    """Increment the play count for a user-song pair in Redis."""
+def atomic_hot_update(session_id: str, song_id: str, new_vec: np.ndarray, timestamp_ms: int) -> None:
+    """
+    Atomically update session vector hash, increment playcount (Redis), and push to history list.
+    Uses a Lua script to guarantee all three operations succeed or none.
+    Note: This does NOT update Cassandra playcount_agg; call increment_playcount_cassandra separately.
+    """
+    try:
+        r = get_redis_client()
+        blob = _vec_to_blob(new_vec)
+        norm = float(np.linalg.norm(new_vec))
+        sess_vec_key = f"sess_vec:{session_id}"
+        playcount_key = f"user_playcount:{USER_ID}:{song_id}"
+        sess_hist_key = f"sess_hist:{session_id}"
+        # Register and execute Lua script
+        r.eval(ATOMIC_HOT_UPDATE_LUA, 3, sess_vec_key, playcount_key, sess_hist_key,
+               blob, norm, song_id, timestamp_ms)
+    except Exception as e:
+        print(f"Warning: Atomic hot-state update failed: {e}")
+
+
+def increment_playcount_redis(user_id: str, song_id: str, amount: int = 1) -> None:
+    """Increment the play count for a user-song pair in Redis only."""
     try:
         r = get_redis_client()
         key = f"user_playcount:{user_id}:{song_id}"
@@ -371,6 +431,24 @@ def get_playcount(user_id: str, song_id: str) -> int:
         return int(count)
     except Exception:
         return 0
+
+
+def increment_playcount_cassandra(user_id: str, song_id: str, amount: int = 1) -> None:
+    """Update the play count for a user-song pair in Cassandra by copying the value from Redis."""
+    try:
+        session = get_cassandra_session()
+        # Get the current play count from Redis
+        count = get_playcount(user_id, song_id)
+        # Update Cassandra with the count and current timestamp
+        session.execute(
+            """
+            INSERT INTO playcount_agg (user_id, song_id, play_count, last_played)
+            VALUES (%s, %s, %s, %s)
+            """,
+            (user_id, song_id, count, datetime.now()),
+        )
+    except Exception as e:
+        print(f"Warning: Failed to update playcount_agg in Cassandra: {e}")
 
 
 # -------------------------- Session history (Redis list) --------------------------
@@ -408,6 +486,47 @@ def clear_session_history(session_id: str) -> None:
         r.delete(f"sess_hist:{session_id}")
     except Exception as e:
         print(f"Warning: Failed to clear session history in Redis: {e}")
+
+
+# -------------------------- Top-N recommendation cache (Redis) --------------------------
+def set_top_n_cache(user_id: str, algo: str, recommendations: List[Tuple[float, str]], ttl_seconds: int = 300) -> None:
+    """
+    Store top-N recommendations as a sorted set.
+    Key: top_n:<user_id>:<algo>
+    Score: recommendation score (float)
+    Member: song_id string
+    Optional TTL to auto-expire.
+    """
+    try:
+        r = get_redis_client()
+        key = f"top_n:{user_id}:{algo}"
+        # Use ZADD with NX? We'll just replace: delete then add.
+        r.delete(key)
+        if recommendations:
+            # ZADD expects mapping of member->score
+            mapping = {song_id: score for score, song_id in recommendations}
+            r.zadd(key, mapping)
+            if ttl_seconds > 0:
+                r.expire(key, ttl_seconds)
+    except Exception as e:
+        print(f"Warning: Failed to set top-N cache: {e}")
+
+
+def get_top_n_cache(user_id: str, algo: str) -> List[Tuple[str, float]]:
+    """Retrieve top-N cache (list of (song_id, score) sorted descending)."""
+    try:
+        r = get_redis_client()
+        key = f"top_n:{user_id}:{algo}"
+        # Get all with scores, sorted descending
+        res = r.zrevrange(key, 0, -1, withscores=True)
+        # res is list of (member, score) where member is bytes
+        out = []
+        for member, score in res:
+            song_id = member.decode() if isinstance(member, bytes) else member
+            out.append((song_id, float(score)))
+        return out
+    except Exception:
+        return []
 
 
 # -------------------------- Listening event logging (Cassandra) --------------------------
@@ -467,7 +586,7 @@ def log_session_summary(
                 end_time,
                 track_ids,
                 event_count,
-                context_tags,  # pass the set directly
+                context_tags,  # pass set directly
                 vector_blob,
             ),
         )
